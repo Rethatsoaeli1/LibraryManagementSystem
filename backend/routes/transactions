@@ -1,0 +1,128 @@
+
+const express = require('express');
+const router = express.Router();
+const db = require('../config/db');
+const authorizeRole = require('../middleware/authorizeRole');
+
+
+// GET all transactions (Admin and Member)
+router.get('/', async (req, res) => {
+    try {
+        const [transactions] = await db.query(`
+            SELECT
+                transactions.id,
+                transactions.action,
+                transactions.quantity,
+                transactions.transaction_date,
+                books.title AS book_title,
+                users.name AS user_name
+            FROM transactions
+            LEFT JOIN books ON transactions.book_id = books.id
+            LEFT JOIN users ON transactions.user_id = users.id
+            ORDER BY transactions.transaction_date DESC
+        `);
+
+        res.json(transactions);
+
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+});
+
+
+// POST - Create a transaction and update book stock
+router.post('/', async (req, res) => {
+    let connection;
+
+    try {
+        const { book_id, action, quantity } = req.body;
+
+        if (!book_id || !action || !Number.isInteger(quantity) || quantity <= 0) {
+            return res.status(400).json({
+                message: 'Valid book ID, action and quantity are required.'
+            });
+        }
+
+        const allowedActions = ['Borrow', 'Return', 'Add Stock', 'Deduct Stock'];
+
+        if (!allowedActions.includes(action)) {
+            return res.status(400).json({
+                message: 'Invalid transaction action.'
+            });
+        }
+
+        // Only Admins can add or deduct stock
+        if (
+            ['Add Stock', 'Deduct Stock'].includes(action) &&
+            req.user.role !== 'Admin'
+        ) {
+            return res.status(403).json({
+                message: 'Only Admins can add or deduct stock.'
+            });
+        }
+
+        connection = await db.getConnection();
+
+        await connection.beginTransaction();
+
+        const [books] = await connection.query(
+            'SELECT quantity FROM books WHERE id = ? FOR UPDATE',
+            [book_id]
+        );
+
+        if (books.length === 0) {
+            await connection.rollback();
+
+            return res.status(404).json({
+                message: 'Book not found.'
+            });
+        }
+
+        const currentStock = books[0].quantity;
+
+        if (['Borrow', 'Deduct Stock'].includes(action) && quantity > currentStock) {
+            await connection.rollback();
+
+            return res.status(400).json({
+                message: 'Not enough stock available.'
+            });
+        }
+
+        const newStock = ['Borrow', 'Deduct Stock'].includes(action)
+            ? currentStock - quantity
+            : currentStock + quantity;
+
+        await connection.query(
+            'UPDATE books SET quantity = ? WHERE id = ?',
+            [newStock, book_id]
+        );
+
+        await connection.query(
+            'INSERT INTO transactions (user_id, book_id, action, quantity) VALUES (?, ?, ?, ?)',
+            [req.user.id, book_id, action, quantity]
+        );
+
+        await connection.commit();
+
+        res.status(201).json({
+            message: 'Transaction completed successfully!',
+            newStock
+        });
+
+    } catch (error) {
+        if (connection) {
+            await connection.rollback();
+        }
+
+        res.status(500).json({
+            message: error.message
+        });
+
+    } finally {
+        if (connection) {
+            connection.release();
+        }
+    }
+});
+
+module.exports = router;
